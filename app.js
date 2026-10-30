@@ -184,11 +184,14 @@ function limitFromTags(tags, forward) {
 // ---------- Kartendaten (Overpass) ----------
 const ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
   "https://overpass.private.coffee/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
 ];
-const RADIUS = 400;        // Umkreis pro Abfrage in m
-const REFETCH = 250;       // neu laden, wenn so weit vom letzten Abfragepunkt entfernt
+const HEDGE = 4000;        // so lange auf einen Server warten, bevor zusätzlich der nächste gefragt wird
+const TIMEOUT = 30000;     // Abbruch einer einzelnen Anfrage (Server-Timeout ist 25 s)
+const RADIUS = 1000;       // Umkreis pro Abfrage in m
+const REFETCH = 500;       // neu laden, wenn so weit vom letzten Abfragepunkt entfernt (Puffer für langsame Server)
 const HIGHWAYS = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service|road";
 
 let ways = [];             // [{ tags, pts: [{lat, lon}] }]
@@ -198,27 +201,65 @@ let endpointIdx = 0;
 let retryAfter = 0;
 let currentWayId = null;
 
+// Fragt zuerst den zuletzt erfolgreichen Server. Antwortet er nicht binnen HEDGE ms
+// (oder mit Fehler), kommt der nächste dazu; die erste brauchbare Antwort gewinnt.
+function queryOverpass(q) {
+  const base = endpointIdx;
+  const ctrls = [];
+  return new Promise((resolve, reject) => {
+    let started = 0, pending = 0, done = false;
+    const startNext = () => {
+      if (done || started >= ENDPOINTS.length) return;
+      const i = started++;
+      pending++;
+      const ctrl = new AbortController();
+      ctrls.push(ctrl);
+      const timer = setTimeout(() => ctrl.abort(), TIMEOUT);
+      const hedge = setTimeout(startNext, HEDGE);
+      fetch(ENDPOINTS[(base + i) % ENDPOINTS.length], {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "data=" + encodeURIComponent(q),
+        signal: ctrl.signal,
+      })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(res.status);
+          const json = await res.json();
+          // Bei Überlast/Timeout liefert Overpass 200 mit "remark" und unvollständigen Daten
+          if (!Array.isArray(json.elements) || json.remark) throw new Error("unvollständig");
+          if (done) return;
+          done = true;
+          endpointIdx = (base + i) % ENDPOINTS.length;
+          ctrls.forEach((c) => c.abort());
+          resolve(json);
+        })
+        .catch(() => {
+          clearTimeout(hedge);
+          startNext();
+        })
+        .finally(() => {
+          clearTimeout(timer);
+          pending--;
+          if (!done && pending === 0 && started >= ENDPOINTS.length) reject(new Error("kein Server erreichbar"));
+        });
+    };
+    startNext();
+  });
+}
+
 async function loadWays(lat, lon) {
   if (fetching || Date.now() < retryAfter) return;
   fetching = true;
   if (!ways.length) setStatus("Lade Kartendaten …");
-  const q = `[out:json][timeout:15];way(around:${RADIUS},${lat.toFixed(6)},${lon.toFixed(6)})[highway~"^(${HIGHWAYS})$"];out tags geom qt;`;
+  const q = `[out:json][timeout:25];way(around:${RADIUS},${lat.toFixed(6)},${lon.toFixed(6)})[highway~"^(${HIGHWAYS})$"];out tags geom qt;`;
   try {
-    const res = await fetch(ENDPOINTS[endpointIdx], {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "data=" + encodeURIComponent(q),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) throw new Error(res.status);
-    const json = await res.json();
+    const json = await queryOverpass(q);
     ways = json.elements
       .filter((e) => e.type === "way" && e.geometry)
       .map((e) => ({ id: e.id, tags: e.tags || {}, pts: e.geometry }));
     fetchCenter = { lat, lon };
   } catch {
-    endpointIdx = (endpointIdx + 1) % ENDPOINTS.length;
-    retryAfter = Date.now() + 10000;
+    retryAfter = Date.now() + 5000;
     if (!ways.length) setStatus("Kartendaten nicht erreichbar – neuer Versuch …", "bad");
   } finally {
     fetching = false;
