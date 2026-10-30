@@ -1,4 +1,4 @@
-const CACHE = "tempo-warner-v2";
+const CACHE = "tempo-warner-v3";
 const FILES = [
   "./",
   "index.html",

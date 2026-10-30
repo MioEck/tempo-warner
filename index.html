@@ -89,6 +89,23 @@
       <label class="row">Kein Limit bekannt: innerorts 50 annehmen <input type="checkbox" id="assume50"></label>
     </div>
 
+    <div class="card">
+      <div class="card__title row">Statistik <span class="muted small" id="statSince"></span></div>
+      <table class="stats">
+        <thead><tr><th></th><th>Zu schnell</th><th>Bußgeld</th></tr></thead>
+        <tbody>
+          <tr><th>Innerorts</th><td id="statInnerN">0</td><td id="statInnerFine">0</td></tr>
+          <tr><th>Außerorts</th><td id="statOuterN">0</td><td id="statOuterFine">0</td></tr>
+          <tr class="total"><th>Gesamt</th><td id="statTotalN">0</td><td id="statTotalFine">0</td></tr>
+        </tbody>
+      </table>
+      <div class="muted small">Gezählt wird jede Warnung ab 3 s Dauer. Bußgeld: ab 21 km/h zu schnell nach Abzug der Messtoleranz (3 km/h, über 100 km/h 3 %) laut deutschem Bußgeldkatalog. Innerorts/außerorts aus OpenStreetMap, sonst nach Limit (bis 50 = innerorts). Demo-Fahrten zählen nicht.</div>
+      <div class="card__title">Letzte Überschreitungen</div>
+      <div class="muted" id="statEmpty">Noch keine.</div>
+      <ul class="log" id="statLog"></ul>
+      <button id="statReset" class="btn">Statistik löschen</button>
+    </div>
+
     <p class="muted small center">Kartendaten © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap-Mitwirkende</a></p>
   </section>
 

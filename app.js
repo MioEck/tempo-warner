@@ -30,6 +30,65 @@ let current = null;        // { name, limit, none, note }
 let over = false;
 let demo = false;
 
+// ---------- Statistik ----------
+// Eine Überschreitung = eine Warnphase (wie Banner/Warnton), gezählt ab 3 s Dauer.
+// Bußgeldbereich nach deutschem Bußgeldkatalog: ab 21 km/h zu schnell nach Abzug
+// der Messtoleranz (3 km/h, über 100 km/h 3 %); darunter Verwarnungsgeld.
+const MIN_EPISODE = 3000;
+const FINE_FROM = 21;
+const stats = loadStats();
+let episode = null;
+
+function emptyStats() {
+  return { since: Date.now(), inner: { n: 0, fine: 0 }, outer: { n: 0, fine: 0 }, log: [] };
+}
+function loadStats() {
+  try {
+    const s = JSON.parse(localStorage.getItem("tempo-stats"));
+    return s && s.inner && s.outer ? s : emptyStats();
+  } catch {
+    return emptyStats();
+  }
+}
+function saveStats() {
+  try { localStorage.setItem("tempo-stats", JSON.stringify(stats)); } catch {}
+}
+
+const tolerance = (v) => (v <= 100 ? 3 : Math.ceil(v * 0.03));
+
+function trackOver() {
+  if (over && !demo && current && current.limit != null && speedKmh != null) {
+    const raw = speedKmh - current.limit;
+    if (!episode) episode = { start: Date.now(), raw: -Infinity };
+    if (raw > episode.raw) {
+      Object.assign(episode, {
+        raw,
+        net: Math.round(speedKmh - tolerance(speedKmh) - current.limit),
+        speed: Math.round(speedKmh),
+        limit: current.limit,
+        area: current.area,
+        street: current.name,
+      });
+    }
+  } else if (episode) {
+    endEpisode();
+  }
+}
+
+function endEpisode() {
+  const e = episode;
+  episode = null;
+  if (!e || Date.now() - e.start < MIN_EPISODE) return;
+  const fine = e.net >= FINE_FROM;
+  const bucket = e.area === "inner" ? stats.inner : stats.outer;
+  bucket.n++;
+  if (fine) bucket.fine++;
+  stats.log.unshift({ t: e.start, street: e.street, limit: e.limit, speed: e.speed, net: e.net, area: e.area, fine });
+  stats.log.length = Math.min(stats.log.length, 30);
+  saveStats();
+}
+window.addEventListener("pagehide", () => { if (episode) endEpisode(); });
+
 // ---------- Anzeige ----------
 function render() {
   $("tolText").textContent = `Warnung ab +${settings.tol} km/h`;
@@ -56,6 +115,7 @@ function render() {
   const nowOver = limit != null && speedKmh != null &&
     (over ? speedKmh >= warnAt(limit) - 1 : speedKmh >= warnAt(limit)); // 1 km/h Hysterese gegen Flackern
   setOver(nowOver);
+  trackOver();
 
   if (over) {
     $("bannerText").textContent = `Zu schnell · +${Math.round(speedKmh - limit)} km/h`;
@@ -141,6 +201,14 @@ const ZONES = {
   DK: [50, 80, 130], PL: [50, 90, 140], FR: [50, 80, 130], BE: [50, 70, 120],
   CZ: [50, 90, 130], LU: [50, 90, 130], IT: [50, 90, 130],
 };
+
+// innerorts / außerorts: aus den Tags, sonst nach Limit (bis 50 = innerorts)
+function areaOf(tags, limit) {
+  const t = [tags.maxspeed, tags["maxspeed:type"], tags["source:maxspeed"], tags["zone:maxspeed"]].join(" ").toLowerCase();
+  if (tags.highway === "living_street" || /urban|zone|living_street/.test(t)) return "inner";
+  if (/^motorway/.test(tags.highway) || /rural|motorway/.test(t)) return "outer";
+  return limit != null && limit <= 50 ? "inner" : "outer";
+}
 
 // Liefert { limit } oder { none: true } oder null
 function parseSpeed(v) {
@@ -345,7 +413,8 @@ function onPosition(p) {
   if (m) {
     currentWayId = m.way.id;
     const lim = limitFromTags(m.way.tags, m.forward);
-    current = { name: wayName(m.way.tags), limit: lim.none ? null : lim.limit, none: !!lim.none, note: lim.note };
+    const limit = lim.none ? null : lim.limit;
+    current = { name: wayName(m.way.tags), limit, none: !!lim.none, note: lim.note, area: areaOf(m.way.tags, limit) };
   } else if (ways.length) {
     currentWayId = null;
     current = { name: "Keine Straße erkannt", limit: null, none: false, note: "" };
@@ -406,7 +475,7 @@ function start(isDemo) {
 
 $("startBtn").addEventListener("click", () => start(false));
 $("demoBtn").addEventListener("click", () => start(true));
-$("settingsBtn").addEventListener("click", () => { syncSettingsUI(); show("settings"); });
+$("settingsBtn").addEventListener("click", () => { syncSettingsUI(); renderStats(); show("settings"); });
 $("backBtn").addEventListener("click", () => { show("drive"); render(); });
 
 function syncSettingsUI() {
@@ -434,6 +503,40 @@ $("wakeOn").addEventListener("change", (e) => {
 });
 $("assume50").addEventListener("change", (e) => { settings.assume50 = e.target.checked; saveSettings(); });
 $("testBtn").addEventListener("click", () => { unlockAudio(); beep(true); });
+
+function renderStats() {
+  const fmt = (t, opt) => new Date(t).toLocaleString("de-DE", opt);
+  $("statInnerN").textContent = stats.inner.n;
+  $("statInnerFine").textContent = stats.inner.fine;
+  $("statOuterN").textContent = stats.outer.n;
+  $("statOuterFine").textContent = stats.outer.fine;
+  $("statTotalN").textContent = stats.inner.n + stats.outer.n;
+  $("statTotalFine").textContent = stats.inner.fine + stats.outer.fine;
+  $("statSince").textContent = `seit ${fmt(stats.since, { dateStyle: "medium" })}`;
+
+  const list = $("statLog");
+  list.replaceChildren();
+  $("statEmpty").hidden = stats.log.length > 0;
+  for (const e of stats.log) {
+    const li = document.createElement("li");
+    if (e.fine) li.className = "fine";
+    const top = document.createElement("div");
+    top.className = "log__top";
+    top.textContent = `${e.speed} bei ${e.limit} · ${e.area === "inner" ? "innerorts" : "außerorts"}${e.fine ? " · Bußgeld" : ""}`;
+    const sub = document.createElement("div");
+    sub.className = "muted small";
+    sub.textContent = `${fmt(e.t, { dateStyle: "short", timeStyle: "short" })} · ${e.street}`;
+    li.append(top, sub);
+    list.append(li);
+  }
+}
+
+$("statReset").addEventListener("click", () => {
+  if (!confirm("Statistik wirklich löschen?")) return;
+  Object.assign(stats, emptyStats());
+  saveStats();
+  renderStats();
+});
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {});

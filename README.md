@@ -8,6 +8,7 @@ Progressive Web App fürs Auto: zeigt das **Tempolimit der aktuellen Straße** a
 - Warnton an/aus, Lautstärke, „Ton testen“
 - Optional: fehlt das Limit in der Karte, innerorts 50 annehmen
 - Bildschirm bleibt an (Wake Lock), Hoch- und Querformat, auf dem Homescreen installierbar
+- Statistik in den Einstellungen: Überschreitungen innerorts/außerorts, davon im Bußgeldbereich (ab 21 km/h nach Messtoleranz), letzte 30 Ereignisse
 - Demo-Modus zum Ausprobieren ohne Fahrt
 
 ## Nutzung

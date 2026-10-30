@@ -160,3 +160,16 @@ body.over .speed__unit, body.over .status { color: var(--warn-muted); }
 .col { display: flex; flex-direction: column; gap: 8px; font-size: 18px; font-weight: 600; }
 input[type=checkbox] { width: 28px; height: 28px; flex-shrink: 0; accent-color: var(--red); }
 input[type=range] { width: 100%; height: 32px; accent-color: var(--red); }
+
+/* Statistik */
+.stats { width: 100%; border-collapse: collapse; font-size: 19px; font-variant-numeric: tabular-nums; }
+.stats th, .stats td { padding: 8px 4px; text-align: right; }
+.stats th:first-child { text-align: left; font-weight: 600; }
+.stats thead th { color: var(--muted); font-size: 15px; font-weight: 600; }
+.stats td { font-size: 24px; font-weight: 800; }
+.stats tbody tr + tr { border-top: 1px solid var(--line); }
+.stats td:last-child { color: var(--warn-text); }
+.log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.log li { padding-left: 12px; border-left: 4px solid var(--line); }
+.log li.fine { border-left-color: var(--red); }
+.log__top { font-size: 19px; font-weight: 700; }
