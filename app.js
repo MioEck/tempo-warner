@@ -202,12 +202,13 @@ const ZONES = {
   CZ: [50, 90, 130], LU: [50, 90, 130], IT: [50, 90, 130],
 };
 
-// innerorts / außerorts: aus den Tags, sonst nach Limit (bis 50 = innerorts)
-function areaOf(tags, limit) {
+// innerorts / außerorts: aus den Tags, sonst ob die Position in einem Wohn-/Gewerbegebiet
+// laut OpenStreetMap liegt (Näherung für „innerhalb der Ortsschilder“)
+function areaOf(tags, pos) {
   const t = [tags.maxspeed, tags["maxspeed:type"], tags["source:maxspeed"], tags["zone:maxspeed"]].join(" ").toLowerCase();
-  if (tags.highway === "living_street" || /urban|zone|living_street/.test(t)) return "inner";
+  if (/^(living_street|residential)$/.test(tags.highway) || /urban|zone|living_street/.test(t)) return "inner";
   if (/^motorway/.test(tags.highway) || /rural|motorway/.test(t)) return "outer";
-  return limit != null && limit <= 50 ? "inner" : "outer";
+  return inSettlement(pos) ? "inner" : "outer";
 }
 
 // Liefert { limit } oder { none: true } oder null
@@ -233,7 +234,7 @@ function parseSpeed(v) {
   return null;
 }
 
-function limitFromTags(tags, forward) {
+function limitFromTags(tags, forward, area) {
   const dir = forward ? "maxspeed:forward" : "maxspeed:backward";
   const r =
     parseSpeed(tags[dir]) ||
@@ -243,8 +244,10 @@ function limitFromTags(tags, forward) {
     parseSpeed(tags["zone:maxspeed"]);
   if (r) return r;
   if (tags.highway === "living_street") return { limit: 7, note: "Spielstraße – Schrittgeschwindigkeit" };
-  if (settings.assume50 && !/^(motorway|trunk)/.test(tags.highway)) {
-    return { limit: 50, note: "angenommen – kein Eintrag in der Karte" };
+  if (settings.assume50 && !/^motorway/.test(tags.highway)) {
+    return area === "inner"
+      ? { limit: 50, note: "angenommen: innerorts – kein Eintrag in der Karte" }
+      : { limit: 100, note: "angenommen: außerorts – kein Eintrag in der Karte" };
   }
   return { limit: null, note: "Kein Tempolimit in der Karte eingetragen" };
 }
@@ -258,15 +261,24 @@ const ENDPOINTS = [
 ];
 const HEDGE = 4000;        // so lange auf einen Server warten, bevor zusätzlich der nächste gefragt wird
 const TIMEOUT = 30000;     // Abbruch einer einzelnen Anfrage (Server-Timeout ist 25 s)
-const RADIUS = 1000;       // Umkreis pro Abfrage in m
-const REFETCH = 500;       // neu laden, wenn so weit vom letzten Abfragepunkt entfernt (Puffer für langsame Server)
-const HIGHWAYS = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service|road";
+// Kartendaten kommen in Kacheln (~2,2 × 2 km). Geladen werden immer die eigene und die
+// 8 umliegenden Kacheln, damit beim Weiterfahren schon Daten da sind. Geladene Kacheln
+// bleiben 30 Tage auf dem Gerät – bekannte Strecken brauchen dann keinen Server.
+const TILE_LAT = 0.02;
+const TILE_LON = 0.03;
+const MARGIN = 0.002;      // Überlappung, damit Straßen an Kachelrändern nicht fehlen
+const TILE_CACHE = "tempo-tiles-v1";
+const TILE_MAX_AGE = 30 * 24 * 3600 * 1000;
+const TILE_CACHE_MAX = 400;
+const HIGHWAYS = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|road";
+const LANDUSE = "residential|commercial|retail|industrial";
 
-let ways = [];             // [{ tags, pts: [{lat, lon}] }]
-let fetchCenter = null;
-let fetching = false;
+const tiles = new Map();   // key -> { ways, areas } oder nach Fehler { fails, retryAt }
+let ways = [];             // [{ id, tags, pts: [{lat, lon}] }] aus den Kacheln um die Position
+let areas = [];            // Wohn-/Gewerbegebiete: [{ bbox, pts }]
+let loadingTile = false;
+let mapError = "";
 let endpointIdx = 0;
-let retryAfter = 0;
 let currentWayId = null;
 
 // Fragt zuerst den zuletzt erfolgreichen Server. Antwortet er nicht binnen HEDGE ms
@@ -275,7 +287,7 @@ function queryOverpass(q) {
   const base = endpointIdx;
   const ctrls = [];
   return new Promise((resolve, reject) => {
-    let started = 0, pending = 0, done = false;
+    let started = 0, pending = 0, done = false, lastErr = "";
     const startNext = () => {
       if (done || started >= ENDPOINTS.length) return;
       const i = started++;
@@ -291,47 +303,177 @@ function queryOverpass(q) {
         signal: ctrl.signal,
       })
         .then(async (res) => {
-          if (!res.ok) throw new Error(res.status);
+          if (!res.ok) throw new Error(res.status === 429 ? "Server überlastet" : `Server-Fehler ${res.status}`);
           const json = await res.json();
           // Bei Überlast/Timeout liefert Overpass 200 mit "remark" und unvollständigen Daten
-          if (!Array.isArray(json.elements) || json.remark) throw new Error("unvollständig");
+          if (!Array.isArray(json.elements) || json.remark) throw new Error("Server überlastet");
           if (done) return;
           done = true;
           endpointIdx = (base + i) % ENDPOINTS.length;
           ctrls.forEach((c) => c.abort());
           resolve(json);
         })
-        .catch(() => {
+        .catch((e) => {
+          if (!done) lastErr = e.name === "AbortError" ? "Zeitüberschreitung" : e.name === "TypeError" ? "keine Verbindung" : e.message;
           clearTimeout(hedge);
           startNext();
         })
         .finally(() => {
           clearTimeout(timer);
           pending--;
-          if (!done && pending === 0 && started >= ENDPOINTS.length) reject(new Error("kein Server erreichbar"));
+          if (!done && pending === 0 && started >= ENDPOINTS.length) reject(new Error(lastErr || "kein Server erreichbar"));
         });
     };
     startNext();
   });
 }
 
-async function loadWays(lat, lon) {
-  if (fetching || Date.now() < retryAfter) return;
-  fetching = true;
-  if (!ways.length) setStatus("Lade Kartendaten …");
-  const q = `[out:json][timeout:25];way(around:${RADIUS},${lat.toFixed(6)},${lon.toFixed(6)})[highway~"^(${HIGHWAYS})$"];out tags geom qt;`;
-  try {
-    const json = await queryOverpass(q);
-    ways = json.elements
-      .filter((e) => e.type === "way" && e.geometry)
-      .map((e) => ({ id: e.id, tags: e.tags || {}, pts: e.geometry }));
-    fetchCenter = { lat, lon };
-  } catch {
-    retryAfter = Date.now() + 5000;
-    if (!ways.length) setStatus("Kartendaten nicht erreichbar – neuer Versuch …", "bad");
-  } finally {
-    fetching = false;
+const tileOf = (pos) => [Math.floor(pos.lat / TILE_LAT), Math.floor(pos.lon / TILE_LON)];
+const tileKey = ([y, x]) => `${y}_${x}`;
+
+function tileQuery([y, x]) {
+  const bb = [y * TILE_LAT - MARGIN, x * TILE_LON - MARGIN, (y + 1) * TILE_LAT + MARGIN, (x + 1) * TILE_LON + MARGIN]
+    .map((v) => v.toFixed(4)).join(",");
+  return `[out:json][timeout:25];(way[highway~"^(${HIGHWAYS})$"](${bb});way[landuse~"^(${LANDUSE})$"](${bb}););out tags geom qt;`;
+}
+
+function parseTile(json) {
+  const w = [], a = [];
+  for (const e of json.elements) {
+    if (e.type !== "way" || !e.geometry) continue;
+    const tags = e.tags || {};
+    if (tags.highway) {
+      w.push({ id: e.id, tags, pts: e.geometry });
+    } else if (tags.landuse && e.geometry.length > 3) {
+      const lats = e.geometry.map((p) => p.lat), lons = e.geometry.map((p) => p.lon);
+      a.push({ bbox: [Math.min(...lats), Math.min(...lons), Math.max(...lats), Math.max(...lons)], pts: e.geometry });
+    }
   }
+  return { ways: w, areas: a };
+}
+
+async function cacheGet(key) {
+  try {
+    const res = await (await caches.open(TILE_CACHE)).match(`tiles/${key}`);
+    if (!res) return null;
+    const { t, data } = await res.json();
+    return Date.now() - t < TILE_MAX_AGE ? data : null;
+  } catch {
+    return null;
+  }
+}
+async function cachePut(key, data) {
+  try {
+    const c = await caches.open(TILE_CACHE);
+    await c.put(`tiles/${key}`, new Response(JSON.stringify({ t: Date.now(), data })));
+    const keys = await c.keys(); // in Einfügereihenfolge: älteste zuerst
+    await Promise.all(keys.slice(0, Math.max(0, keys.length - TILE_CACHE_MAX)).map((k) => c.delete(k)));
+  } catch {}
+}
+
+// Reihenfolge: eigene Kachel, dann die Kacheln in Fahrtrichtung (bis ~2 km voraus),
+// dann die übrigen Nachbarn nach Abstand zur Position
+function wantedTiles(pos, heading) {
+  const list = new Map();
+  const add = (t) => list.set(tileKey(t), t);
+  add(tileOf(pos));
+  if (heading != null) {
+    const r = (heading * Math.PI) / 180;
+    const kx = 111320 * Math.cos((pos.lat * Math.PI) / 180);
+    for (const d of [700, 1400, 2100]) {
+      add(tileOf({ lat: pos.lat + (d * Math.cos(r)) / 110540, lon: pos.lon + (d * Math.sin(r)) / kx }));
+    }
+  }
+  const [y, x] = tileOf(pos);
+  const near = [];
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) near.push([y + dy, x + dx]);
+  // Abstand zum nächsten Punkt der Kachel
+  const d = ([ty, tx]) => dist(pos, {
+    lat: Math.min(Math.max(pos.lat, ty * TILE_LAT), (ty + 1) * TILE_LAT),
+    lon: Math.min(Math.max(pos.lon, tx * TILE_LON), (tx + 1) * TILE_LON),
+  });
+  near.sort((a, b) => d(a) - d(b)).forEach(add);
+  return [...list.values()];
+}
+
+function rebuildWays() {
+  const byId = new Map();
+  areas = [];
+  for (const t of tiles.values()) {
+    if (!t.ways) continue;
+    for (const w of t.ways) byId.set(w.id, w);
+    areas.push(...t.areas);
+  }
+  ways = [...byId.values()];
+}
+
+// Lädt nacheinander alle fehlenden Kacheln um die aktuelle Position
+async function ensureTiles() {
+  if (loadingTile || !last) return;
+  const want = wantedTiles(last.pos, lastHeading);
+  const keep = new Set(want.map(tileKey));
+  let dropped = false;
+  for (const k of tiles.keys()) if (!keep.has(k)) { tiles.delete(k); dropped = true; }
+  if (dropped) rebuildWays();
+
+  const now = Date.now();
+  const next = want.find((t) => { const e = tiles.get(tileKey(t)); return !e || (!e.ways && now >= e.retryAt); });
+  if (!next) return;
+  const key = tileKey(next);
+  loadingTile = true;
+  try {
+    let data = await cacheGet(key);
+    if (!data) {
+      if (!navigator.onLine) throw new Error("kein Internet");
+      data = parseTile(await queryOverpass(tileQuery(next)));
+      cachePut(key, data);
+    }
+    tiles.set(key, data);
+    mapError = "";
+    rebuildWays();
+  } catch (e) {
+    const fails = ((tiles.get(key) || {}).fails || 0) + 1;
+    tiles.set(key, { fails, retryAt: Date.now() + Math.min(60000, 5000 * 2 ** (fails - 1)) });
+    mapError = e.message;
+  } finally {
+    loadingTile = false;
+  }
+  ensureTiles();
+}
+// Fehlgeschlagene Kacheln auch ohne neue GPS-Position erneut versuchen
+setInterval(ensureTiles, 5000);
+
+const tileReady = (pos) => !!(tiles.get(tileKey(tileOf(pos))) || {}).ways;
+
+function pointInPoly(p, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const a = pts[i], b = pts[j];
+    if ((a.lat > p.lat) !== (b.lat > p.lat) && p.lon < ((b.lon - a.lon) * (p.lat - a.lat)) / (b.lat - a.lat) + a.lon) inside = !inside;
+  }
+  return inside;
+}
+
+// Abstand in m von p zur Strecke a–b
+function segDist(p, a, b) {
+  const kx = 111320 * Math.cos((p.lat * Math.PI) / 180), ky = 110540;
+  const ax = (a.lon - p.lon) * kx, ay = (a.lat - p.lat) * ky;
+  const dx = (b.lon - a.lon) * kx, dy = (b.lat - a.lat) * ky;
+  const t = Math.max(0, Math.min(1, -(ax * dx + ay * dy) / (dx * dx + dy * dy || 1)));
+  return Math.hypot(ax + t * dx, ay + t * dy);
+}
+
+// Im Wohn-/Gewerbegebiet oder höchstens 25 m davon entfernt (Ortsdurchfahrten liegen oft
+// genau zwischen zwei Gebietsflächen)
+function inSettlement(pos) {
+  const m = 0.0004; // ~25–45 m
+  for (const a of areas) {
+    const [s, w, n, e] = a.bbox;
+    if (pos.lat < s - m || pos.lat > n + m || pos.lon < w - m || pos.lon > e + m) continue;
+    if (pointInPoly(pos, a.pts)) return true;
+    for (let i = 0; i < a.pts.length - 1; i++) if (segDist(pos, a.pts[i], a.pts[i + 1]) <= 25) return true;
+  }
+  return false;
 }
 
 // Abstand in m zwischen zwei Punkten (für kurze Strecken ausreichend genau)
@@ -384,6 +526,7 @@ function wayName(tags) {
 
 // ---------- GPS ----------
 let last = null;
+let lastHeading = null;
 let lastFixAt = 0;
 
 function onPosition(p) {
@@ -405,24 +548,29 @@ function onPosition(p) {
   if (speedKmh != null && speedKmh < 8) heading = null; // im Stand ist die Richtung unzuverlässig
 
   last = { pos, t: now };
+  if (heading != null) lastHeading = heading;
   lastFixAt = Date.now();
 
-  if (!fetchCenter || dist(fetchCenter, pos) > REFETCH) loadWays(pos.lat, pos.lon);
+  ensureTiles();
 
   const m = ways.length ? matchWay(pos, heading) : null;
   if (m) {
     currentWayId = m.way.id;
-    const lim = limitFromTags(m.way.tags, m.forward);
-    const limit = lim.none ? null : lim.limit;
-    current = { name: wayName(m.way.tags), limit, none: !!lim.none, note: lim.note, area: areaOf(m.way.tags, limit) };
-  } else if (ways.length) {
+    const area = areaOf(m.way.tags, pos);
+    const lim = limitFromTags(m.way.tags, m.forward, area);
+    current = { name: wayName(m.way.tags), limit: lim.none ? null : lim.limit, none: !!lim.none, note: lim.note, area };
+  } else if (tileReady(pos)) {
     currentWayId = null;
     current = { name: "Keine Straße erkannt", limit: null, none: false, note: "" };
+  } else {
+    current = null; // Kachel noch nicht geladen
   }
 
   const acc = Math.round(p.coords.accuracy);
-  if (!fetching || ways.length) {
+  if (tileReady(pos)) {
     setStatus(`GPS aktiv · Genauigkeit ${acc} m`, acc <= 25 ? "ok" : "bad");
+  } else {
+    setStatus(mapError ? `Kartendaten: ${mapError} – neuer Versuch …` : "Lade Kartendaten …", "bad");
   }
   render();
 }
