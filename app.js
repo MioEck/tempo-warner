@@ -1,0 +1,399 @@
+"use strict";
+
+// ---------- Einstellungen ----------
+const DEFAULTS = { tol: 5, sound: true, volume: 80, wake: true, assume50: false };
+const settings = loadSettings();
+
+function loadSettings() {
+  try {
+    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem("tempo-settings") || "{}") };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+function saveSettings() {
+  try { localStorage.setItem("tempo-settings", JSON.stringify(settings)); } catch {}
+}
+
+const $ = (id) => document.getElementById(id);
+const screens = { start: $("start"), drive: $("drive"), settings: $("settings") };
+function show(name) {
+  for (const [k, el] of Object.entries(screens)) el.hidden = k !== name;
+}
+
+// Ab welcher Geschwindigkeit gewarnt wird: Limit + Toleranz (bei +0 erst über dem Limit)
+const warnAt = (limit) => limit + Math.max(settings.tol, 1);
+
+// ---------- Zustand ----------
+let speedKmh = null;
+let current = null;        // { name, limit, none, note }
+let over = false;
+let demo = false;
+
+// ---------- Anzeige ----------
+function render() {
+  $("tolText").textContent = `Warnung ab +${settings.tol} km/h`;
+
+  const sign = $("sign");
+  sign.classList.remove("unknown", "none", "three");
+  if (!current || (current.limit == null && !current.none)) {
+    sign.classList.add("unknown");
+    $("limit").textContent = "?";
+    sign.setAttribute("aria-label", "Tempolimit unbekannt");
+  } else if (current.none) {
+    sign.classList.add("none");
+    sign.setAttribute("aria-label", "Keine Geschwindigkeitsbegrenzung");
+  } else {
+    $("limit").textContent = current.limit;
+    if (current.limit >= 100) sign.classList.add("three");
+    sign.setAttribute("aria-label", `Tempolimit ${current.limit} km/h`);
+  }
+
+  $("street").textContent = current ? current.name : "Suche Straße …";
+  $("speed").textContent = speedKmh == null ? "–" : Math.round(speedKmh);
+
+  const limit = current && current.limit;
+  const nowOver = limit != null && speedKmh != null &&
+    (over ? speedKmh >= warnAt(limit) - 1 : speedKmh >= warnAt(limit)); // 1 km/h Hysterese gegen Flackern
+  setOver(nowOver);
+
+  if (over) {
+    $("bannerText").textContent = `Zu schnell · +${Math.round(speedKmh - limit)} km/h`;
+    $("sub").textContent = `Warnung ab ${warnAt(limit)} km/h (Limit +${settings.tol})`;
+  } else {
+    $("sub").textContent = current && current.note ? current.note : "Tempolimit laut OpenStreetMap";
+  }
+}
+
+function setOver(v) {
+  if (v === over) return;
+  over = v;
+  document.body.classList.toggle("over", v);
+  $("banner").hidden = !v;
+  if (v) startAlarm(); else stopAlarm();
+}
+
+function setStatus(text, state) {
+  $("status").textContent = text;
+  $("gpsDot").className = "dot" + (state ? " " + state : "");
+}
+
+// ---------- Warnton ----------
+let audio = null;
+let alarmTimer = null;
+
+function unlockAudio() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  if (!audio) audio = new Ctx();
+  if (audio.state === "suspended") audio.resume();
+}
+
+function beep(force) {
+  if (!audio || (!settings.sound && !force)) return;
+  const vol = settings.volume / 100;
+  const t0 = audio.currentTime;
+  [0, 0.22].forEach((offset, i) => {
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    osc.type = "square";
+    osc.frequency.value = i === 0 ? 880 : 1175;
+    gain.gain.setValueAtTime(0, t0 + offset);
+    gain.gain.linearRampToValueAtTime(0.35 * vol, t0 + offset + 0.01);
+    gain.gain.setValueAtTime(0.35 * vol, t0 + offset + 0.15);
+    gain.gain.linearRampToValueAtTime(0, t0 + offset + 0.18);
+    osc.connect(gain).connect(audio.destination);
+    osc.start(t0 + offset);
+    osc.stop(t0 + offset + 0.2);
+  });
+}
+
+function startAlarm() {
+  beep();
+  alarmTimer = setInterval(() => beep(), 3000);
+}
+function stopAlarm() {
+  clearInterval(alarmTimer);
+  alarmTimer = null;
+}
+
+// ---------- Bildschirm wach halten ----------
+let wakeLock = null;
+async function requestWake() {
+  if (!settings.wake || !("wakeLock" in navigator) || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => { wakeLock = null; });
+  } catch {}
+}
+function releaseWake() {
+  if (wakeLock) wakeLock.release();
+  wakeLock = null;
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && screens.start.hidden) requestWake();
+});
+
+// ---------- Tempolimit aus OSM-Tags ----------
+const ZONES = {
+  // Land: [innerorts, außerorts, Autobahn (null = keine Begrenzung)]
+  DE: [50, 100, null], AT: [50, 100, 130], CH: [50, 80, 120], NL: [50, 80, 100],
+  DK: [50, 80, 130], PL: [50, 90, 140], FR: [50, 80, 130], BE: [50, 70, 120],
+  CZ: [50, 90, 130], LU: [50, 90, 130], IT: [50, 90, 130],
+};
+
+// Liefert { limit } oder { none: true } oder null
+function parseSpeed(v) {
+  if (!v) return null;
+  v = String(v).trim().toLowerCase();
+  if (v === "none") return { none: true };
+  if (v === "walk") return { limit: 7, note: "Schrittgeschwindigkeit" };
+  let m = v.match(/^(\d+)\s*(mph)?$/);
+  if (m) return { limit: m[2] ? Math.round(+m[1] * 1.609) : +m[1] };
+  m = v.match(/^([a-z]{2}):(.+)$/);
+  if (m) {
+    const z = ZONES[m[1].toUpperCase()] || ZONES.DE;
+    const kind = m[2];
+    let n = kind.match(/zone:?(\d+)/);
+    if (n) return { limit: +n[1], note: `Tempo-${n[1]}-Zone` };
+    if (kind === "urban") return { limit: z[0], note: "innerorts" };
+    if (kind === "rural") return { limit: z[1], note: "außerorts" };
+    if (kind === "motorway") return z[2] == null ? { none: true } : { limit: z[2] };
+    if (kind === "living_street") return { limit: 7, note: "Spielstraße – Schrittgeschwindigkeit" };
+    if (kind === "bicycle_road") return { limit: 30, note: "Fahrradstraße" };
+  }
+  return null;
+}
+
+function limitFromTags(tags, forward) {
+  const dir = forward ? "maxspeed:forward" : "maxspeed:backward";
+  const r =
+    parseSpeed(tags[dir]) ||
+    parseSpeed(tags.maxspeed) ||
+    parseSpeed(tags["maxspeed:type"]) ||
+    parseSpeed(tags["source:maxspeed"]) ||
+    parseSpeed(tags["zone:maxspeed"]);
+  if (r) return r;
+  if (tags.highway === "living_street") return { limit: 7, note: "Spielstraße – Schrittgeschwindigkeit" };
+  if (settings.assume50 && !/^(motorway|trunk)/.test(tags.highway)) {
+    return { limit: 50, note: "angenommen – kein Eintrag in der Karte" };
+  }
+  return { limit: null, note: "Kein Tempolimit in der Karte eingetragen" };
+}
+
+// ---------- Kartendaten (Overpass) ----------
+const ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+];
+const RADIUS = 400;        // Umkreis pro Abfrage in m
+const REFETCH = 250;       // neu laden, wenn so weit vom letzten Abfragepunkt entfernt
+const HIGHWAYS = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service|road";
+
+let ways = [];             // [{ tags, pts: [{lat, lon}] }]
+let fetchCenter = null;
+let fetching = false;
+let endpointIdx = 0;
+let retryAfter = 0;
+let currentWayId = null;
+
+async function loadWays(lat, lon) {
+  if (fetching || Date.now() < retryAfter) return;
+  fetching = true;
+  if (!ways.length) setStatus("Lade Kartendaten …");
+  const q = `[out:json][timeout:15];way(around:${RADIUS},${lat.toFixed(6)},${lon.toFixed(6)})[highway~"^(${HIGHWAYS})$"];out tags geom qt;`;
+  try {
+    const res = await fetch(ENDPOINTS[endpointIdx], {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "data=" + encodeURIComponent(q),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) throw new Error(res.status);
+    const json = await res.json();
+    ways = json.elements
+      .filter((e) => e.type === "way" && e.geometry)
+      .map((e) => ({ id: e.id, tags: e.tags || {}, pts: e.geometry }));
+    fetchCenter = { lat, lon };
+  } catch {
+    endpointIdx = (endpointIdx + 1) % ENDPOINTS.length;
+    retryAfter = Date.now() + 10000;
+    if (!ways.length) setStatus("Kartendaten nicht erreichbar – neuer Versuch …", "bad");
+  } finally {
+    fetching = false;
+  }
+}
+
+// Abstand in m zwischen zwei Punkten (für kurze Strecken ausreichend genau)
+function dist(a, b) {
+  const kx = 111320 * Math.cos((a.lat * Math.PI) / 180);
+  return Math.hypot((b.lon - a.lon) * kx, (b.lat - a.lat) * 110540);
+}
+
+function angleDiff(a, b) {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+// Nächste Straße zur Position finden; Fahrtrichtung (heading) hilft an Kreuzungen
+function matchWay(pos, heading) {
+  const kx = 111320 * Math.cos((pos.lat * Math.PI) / 180);
+  const ky = 110540;
+  let best = null;
+
+  for (const w of ways) {
+    for (let i = 0; i < w.pts.length - 1; i++) {
+      const ax = (w.pts[i].lon - pos.lon) * kx, ay = (w.pts[i].lat - pos.lat) * ky;
+      const bx = (w.pts[i + 1].lon - pos.lon) * kx, by = (w.pts[i + 1].lat - pos.lat) * ky;
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, -(ax * dx + ay * dy) / len2));
+      const d = Math.hypot(ax + t * dx, ay + t * dy);
+      const bearing = ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360;
+
+      let score = d;
+      let forward = true;
+      if (heading != null) {
+        const diff = angleDiff(heading, bearing);
+        forward = diff <= 90;
+        score += (Math.min(diff, 180 - diff) / 90) * 30;
+      }
+      if (w.tags.highway === "service") score += 8;
+      if (w.id === currentWayId) score -= 5;
+
+      if (!best || score < best.score) best = { way: w, score, d, forward };
+    }
+  }
+  return best && best.d < 40 ? best : null;
+}
+
+function wayName(tags) {
+  if (tags.name && tags.ref) return `${tags.name} (${tags.ref})`;
+  return tags.name || tags.ref || "Unbenannte Straße";
+}
+
+// ---------- GPS ----------
+let last = null;
+let lastFixAt = 0;
+
+function onPosition(p) {
+  const pos = { lat: p.coords.latitude, lon: p.coords.longitude };
+  const now = p.timestamp || Date.now();
+
+  let v = p.coords.speed;
+  if (v == null || Number.isNaN(v)) {
+    // Gerät liefert keine Geschwindigkeit: aus den letzten zwei Positionen berechnen
+    v = last && now - last.t > 500 ? dist(last.pos, pos) / ((now - last.t) / 1000) : null;
+  }
+  speedKmh = v == null ? null : v * 3.6 < 3 ? 0 : v * 3.6;
+
+  let heading = p.coords.heading;
+  if ((heading == null || Number.isNaN(heading)) && last && dist(last.pos, pos) > 5) {
+    const kx = Math.cos((pos.lat * Math.PI) / 180);
+    heading = ((Math.atan2((pos.lon - last.pos.lon) * kx, pos.lat - last.pos.lat) * 180) / Math.PI + 360) % 360;
+  }
+  if (speedKmh != null && speedKmh < 8) heading = null; // im Stand ist die Richtung unzuverlässig
+
+  last = { pos, t: now };
+  lastFixAt = Date.now();
+
+  if (!fetchCenter || dist(fetchCenter, pos) > REFETCH) loadWays(pos.lat, pos.lon);
+
+  const m = ways.length ? matchWay(pos, heading) : null;
+  if (m) {
+    currentWayId = m.way.id;
+    const lim = limitFromTags(m.way.tags, m.forward);
+    current = { name: wayName(m.way.tags), limit: lim.none ? null : lim.limit, none: !!lim.none, note: lim.note };
+  } else if (ways.length) {
+    currentWayId = null;
+    current = { name: "Keine Straße erkannt", limit: null, none: false, note: "" };
+  }
+
+  const acc = Math.round(p.coords.accuracy);
+  if (!fetching || ways.length) {
+    setStatus(`GPS aktiv · Genauigkeit ${acc} m`, acc <= 25 ? "ok" : "bad");
+  }
+  render();
+}
+
+function onGeoError(e) {
+  const msg = e.code === 1
+    ? "Standort nicht erlaubt – bitte in den Browser-Einstellungen freigeben"
+    : "Kein GPS-Signal";
+  setStatus(msg, "bad");
+}
+
+// Hinweis, wenn länger keine Position kommt
+setInterval(() => {
+  if (!demo && lastFixAt && Date.now() - lastFixAt > 6000) {
+    speedKmh = null;
+    setStatus("GPS-Signal verloren …", "bad");
+    render();
+  }
+}, 2000);
+
+// ---------- Demo ----------
+function startDemo() {
+  demo = true;
+  current = { name: "Demo-Straße", limit: 50, none: false, note: "Demo – keine echten Daten" };
+  setStatus("Demo-Modus", "ok");
+  const t0 = Date.now();
+  const tick = () => {
+    const s = (Date.now() - t0) / 1000;
+    speedKmh = 50 + 10 * Math.sin(s / 3);
+    render();
+  };
+  tick();
+  setInterval(tick, 250);
+}
+
+// ---------- Bedienung ----------
+function start(isDemo) {
+  unlockAudio();
+  requestWake();
+  show("drive");
+  render();
+  if (isDemo) return startDemo();
+  if (!("geolocation" in navigator)) return setStatus("Dieses Gerät hat kein GPS", "bad");
+  navigator.geolocation.watchPosition(onPosition, onGeoError, {
+    enableHighAccuracy: true,
+    maximumAge: 0,
+    timeout: 15000,
+  });
+}
+
+$("startBtn").addEventListener("click", () => start(false));
+$("demoBtn").addEventListener("click", () => start(true));
+$("settingsBtn").addEventListener("click", () => { syncSettingsUI(); show("settings"); });
+$("backBtn").addEventListener("click", () => { show("drive"); render(); });
+
+function syncSettingsUI() {
+  for (const b of $("tolGrid").children) b.classList.toggle("active", +b.dataset.tol === settings.tol);
+  $("tolHint").textContent = `Bei Limit 50 piept es ab ${warnAt(50)} km/h.`;
+  $("soundOn").checked = settings.sound;
+  $("volume").value = settings.volume;
+  $("wakeOn").checked = settings.wake;
+  $("assume50").checked = settings.assume50;
+}
+
+$("tolGrid").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  settings.tol = +b.dataset.tol;
+  saveSettings();
+  syncSettingsUI();
+});
+$("soundOn").addEventListener("change", (e) => { settings.sound = e.target.checked; saveSettings(); });
+$("volume").addEventListener("input", (e) => { settings.volume = +e.target.value; saveSettings(); });
+$("wakeOn").addEventListener("change", (e) => {
+  settings.wake = e.target.checked;
+  saveSettings();
+  settings.wake ? requestWake() : releaseWake();
+});
+$("assume50").addEventListener("change", (e) => { settings.assume50 = e.target.checked; saveSettings(); });
+$("testBtn").addEventListener("click", () => { unlockAudio(); beep(true); });
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
